@@ -6,7 +6,7 @@ on:
       KERNEL_NAME:
         description: "Custom kernel name"
         required: true
-        default: ""
+        default: "Aetherium"
       BASE_REPO:
         description: "Base kernel repo (e.g. ramabondanp or android.googlesource.com/kernel/common.git)"
         required: true
@@ -60,7 +60,7 @@ on:
         required: false
         default: ""
       LTO_TYPE:
-        description: "LTO type"
+        description: "LTO type (set to 'none' for fastest build)"
         required: false
         type: choice
         options:
@@ -412,7 +412,7 @@ jobs:
           fi
 
       # ──────────────────────────────────────────────
-      # 5. Toolchain & Build (with speed optimisations)
+      # 5. Toolchain & Build (Stable Fast)
       # ──────────────────────────────────────────────
       - name: Cache Neutron Clang
         id: cache-clang
@@ -440,7 +440,7 @@ jobs:
           restore-keys: |
             ccache-${{ runner.os }}-
 
-      - name: Build kernel
+      - name: Build kernel (Stable Fast)
         run: |
           cd kernel
           mkdir -p "$GITHUB_WORKSPACE/dist"
@@ -450,7 +450,7 @@ jobs:
           export LLVM=1
           export LLVM_IAS=1
 
-          # Use ccache with sloppiness for better hits
+          # ccache optimisations
           export CC="ccache clang"
           export CROSS_COMPILE="ccache aarch64-linux-gnu-"
           export CCACHE_DIR=~/.ccache
@@ -461,18 +461,17 @@ jobs:
           export CCACHE_COMPILERCHECK=content
           export PATH="/usr/lib/ccache:$PATH"
 
-          # Add -pipe to compiler flags
+          # Use -pipe for faster compilation (less I/O)
           export KCFLAGS="-pipe"
 
           echo "::group::Configuring (gki_defconfig)"
           make O=out gki_defconfig
 
-          # ---- Set CONFIG_HZ to 500 (hardcoded) ----
+          # ---- HZ=500 ----
           scripts/config --file out/.config -e CONFIG_HZ_500
           scripts/config --file out/.config -d CONFIG_HZ_100
           scripts/config --file out/.config -d CONFIG_HZ_250
           scripts/config --file out/.config -d CONFIG_HZ_300
-          # also disable 1000 if it was enabled by default
           scripts/config --file out/.config -d CONFIG_HZ_1000
 
           # ---- Disable debug info (saves ~3-5 min) ----
@@ -481,6 +480,8 @@ jobs:
           scripts/config --file out/.config -d CONFIG_DEBUG_INFO_BTF
           scripts/config --file out/.config -d CONFIG_DEBUG_KERNEL
           scripts/config --file out/.config -d CONFIG_DEBUG_MISC
+
+          # Keep -O2 (stable) – do NOT override with -Os or size optimisations
 
           make O=out olddefconfig
           echo "::endgroup::"
@@ -502,12 +503,13 @@ jobs:
               make O=out olddefconfig
               echo "::endgroup::"
               ;;
+            # none: skip LTO config entirely (fastest)
           esac
 
-          echo "::group::Compiling kernel"
+          echo "::group::Compiling kernel (parallel 4 jobs)"
           set -o pipefail
-          # Use -j6 (3× cores) – swap can handle it
-          make O=out -j$(($(nproc --all)*3)) Image 2>&1 | tee build.log || {
+          # Safe parallelism: 4 jobs for 2-core with HT
+          make O=out -j4 Image 2>&1 | tee build.log || {
             echo "::error::Build failed! Check build.log."
             exit 1
           }
@@ -593,7 +595,7 @@ jobs:
           tag_name: ${{ steps.artifacts.outputs.release_tag }}
           name: "${{ steps.artifacts.outputs.build_name }}"
           body: |
-            ## 🔧 ${{ inputs.KERNEL_NAME }} — Android 5.10 GKI Kernel
+            ## 🔧 ${{ inputs.KERNEL_NAME }} — Android 5.10 GKI Kernel (Stable Turbo)
 
             | Property | Value |
             |----------|-------|
@@ -604,12 +606,15 @@ jobs:
             | **Root Manager** | ${{ env.KSU_VER }} |
             | **SuSFS** | ${{ env.SUSFS_STATUS }} |
             | **Build** | #${{ github.run_number }} |
-            | **HZ** | 500 (hardcoded) |
+            | **HZ** | 500 |
+            | **Optimisation** | `-O2` (stable) + `-pipe` + no debug |
 
             ### 📥 Flash
             1. Download zip below
-            2. Flash via **TWRP / EXKM / FKM** atau KernelSU Manager.
+            2. Flash via **TWRP / EXKM / FKM** or KernelSU Manager.
             3. Reboot
+
+            💡 **Want even faster?** Set `LTO_TYPE` to `"none"` in the workflow inputs – this saves 4–6 minutes!
           files: |
             ${{ github.workspace }}/dist/${{ env.ZIP_NAME }}.zip
           draft: false
@@ -638,13 +643,14 @@ jobs:
             FINAL_KSU_VER="${{ env.KSU_VER }}"
           fi
 
-          CAPTION="Build Completed
-          Kernel Version: ${{ env.KVER }}
+          CAPTION="✅ Build Completed (Stable Turbo)
+          Kernel: ${{ env.KVER }}
           Compiler: ${{ env.CLANG_VER }}
           Root Manager: $FINAL_KSU_VER
           SuSFS: ${{ env.SUSFS_STATUS }}
           LTO: ${{ inputs.LTO_TYPE }}
-          HZ: 500"
+          HZ: 500
+          Optimisation: -O2 + -pipe"
 
           curl -F document=@"${{ github.workspace }}/dist/${{ env.ZIP_NAME }}.zip" \
                -F caption="$CAPTION" \
