@@ -1,4 +1,4 @@
-name: X6882 Build 5.10 Kernel + addon (Neutron Clang)
+name: deep
 
 on:
   workflow_dispatch:
@@ -29,12 +29,21 @@ on:
           - "fail-on-conflict"
         default: "theirs-auto"
       ENABLE_KERNELSU_NEXT:
-        description: "Patch KernelSU-Next"
+        description: "Enable KernelSU (Root)"
         required: true
         type: boolean
         default: true
+      ROOT_MANAGER:
+        description: "Root Manager (KSU Fork)"
+        required: true
+        type: choice
+        options:
+          - "KernelSU-Next"
+          - "ReSukiSU"
+          - "SuKiSU-Ultra"
+        default: "KernelSU-Next"
       ENABLE_SUSFS:
-        description: "Patch SuSFS for KernelSU-Next"
+        description: "Patch SuSFS for KernelSU"
         required: true
         type: boolean
         default: true
@@ -42,6 +51,14 @@ on:
         description: "KernelSU-Next branch"
         required: false
         default: "dev-susfs"
+      RESUKISU_BRANCH:
+        description: "ReSukiSU branch (kosongkan untuk default main)"
+        required: false
+        default: ""
+      SUKISU_BRANCH:
+        description: "SuKiSU-Ultra branch (kosongkan untuk default builtin/main)"
+        required: false
+        default: ""
       LTO_TYPE:
         description: "LTO type"
         required: false
@@ -91,8 +108,8 @@ jobs:
       UPSTREAM_TAG: ${{ inputs.UPSTREAM_TAG }}
       MERGE_STRATEGY: ${{ inputs.MERGE_STRATEGY || 'theirs-auto' }}
       ENABLE_KSU: ${{ inputs.ENABLE_KERNELSU_NEXT }}
+      ROOT_MANAGER: ${{ inputs.ROOT_MANAGER }}
       ENABLE_SUSFS: ${{ inputs.ENABLE_SUSFS }}
-      KSU_BRANCH: ${{ inputs.KSU_NEXT_BRANCH || 'dev-susfs' }}
       LTO: ${{ inputs.LTO_TYPE || 'thin' }}
       ENABLE_BBRV3: ${{ inputs.ENABLE_BBRV3 }}
       ENABLE_DROIDSPACES: ${{ inputs.ENABLE_DROIDSPACES }}
@@ -139,10 +156,14 @@ jobs:
           git config --global color.ui false
 
       # ──────────────────────────────────────────────
-      # 1. Clone base kernel (known working)
+      # 1. Clone base kernel & Tools
       # ──────────────────────────────────────────────
       - name: Clone base kernel
         run: |
+          echo "::group::Cloning Luminaire Tools (from aetherium-build)"
+          git clone --depth=1 https://github.com/kaminarich/aetherium-build.git luminaire_tools
+          echo "::endgroup::"
+
           echo "::group::Cloning base kernel: $BASE_REPO ($BASE_BRANCH)"
           git clone --branch "$BASE_BRANCH" "$BASE_REPO" kernel
           echo "::endgroup::"
@@ -235,50 +256,80 @@ jobs:
           fi
 
       # ──────────────────────────────────────────────
-      # 4. Patch KernelSU-Next & SuSFS
+      # 4. Patch Root Manager & SuSFS
       # ──────────────────────────────────────────────
-      - name: Patch KernelSU-Next
+      - name: Patch Root Manager
         run: |
           echo "KSU_VER=Disabled" >> $GITHUB_ENV
           echo "SUSFS_STATUS=Disabled" >> $GITHUB_ENV
 
           if [ "$ENABLE_KSU" = "true" ]; then
             cd kernel
+            export KERNEL_SRC="$PWD"
+            export ROOT_DIR="$GITHUB_WORKSPACE"
+            export LUMINAIRE_PATCH_DIR="$GITHUB_WORKSPACE/luminaire_tools"
 
-            echo "::group::Integrating KernelSU-Next ($KSU_BRANCH)"
-            curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/$KSU_BRANCH/kernel/setup.sh" | bash -s "$KSU_BRANCH"
+            # 🛠️ Tambahan: Deklarasikan fungsi untuk resukisu.sh / sukisu.sh
+            function log() { echo "✅ $1"; }
+            export -f log
+            function error() { echo "❌ $1"; exit 1; }
+            export -f error
+            function warn() { echo "⚠️ $1"; }
+            export -f warn
+
+            echo "::group::Integrating $ROOT_MANAGER"
+            
+            if [ "$ROOT_MANAGER" = "KernelSU-Next" ]; then
+              curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/${{ inputs.KSU_NEXT_BRANCH }}/kernel/setup.sh" | bash -s "${{ inputs.KSU_NEXT_BRANCH }}"
+              
+              DEFCONFIG="arch/arm64/configs/gki_defconfig"
+              if [ -f "$DEFCONFIG" ]; then
+                echo "" >> "$DEFCONFIG"
+                echo "# KernelSU" >> "$DEFCONFIG"
+                echo "CONFIG_KSU=y" >> "$DEFCONFIG"
+                echo "CONFIG_KSU_MANUAL_SU=n" >> "$DEFCONFIG"
+                echo "CONFIG_KSU_KPROBE_HOOKS=y" >> "$DEFCONFIG"
+
+                echo "" >> "$DEFCONFIG"
+                echo "# Required for KSU" >> "$DEFCONFIG"
+                echo "CONFIG_OVERLAY_FS=y" >> "$DEFCONFIG"
+                echo "CONFIG_KPROBES=y" >> "$DEFCONFIG"
+                echo "CONFIG_HAVE_KPROBES=y" >> "$DEFCONFIG"
+                echo "CONFIG_KPROBE_EVENTS=y" >> "$DEFCONFIG"
+                echo "CONFIG_TMPFS_XATTR=y" >> "$DEFCONFIG"
+                echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$DEFCONFIG"
+                echo "✓ Root Manager configs added"
+              fi
+              echo "KSU_VER=$ROOT_MANAGER" >> $GITHUB_ENV
+
+            elif [ "$ROOT_MANAGER" = "ReSukiSU" ]; then
+              if [ -n "${{ inputs.RESUKISU_BRANCH }}" ]; then
+                export RESUKISU_REF="${{ inputs.RESUKISU_BRANCH }}"
+              fi
+              bash "$LUMINAIRE_PATCH_DIR/kernel/android14-6.1-lts/ksu/resukisu/resukisu.sh"
+
+            elif [ "$ROOT_MANAGER" = "SuKiSU-Ultra" ]; then
+              export SUSFS_ENABLED="$ENABLE_SUSFS"
+              if [ -n "${{ inputs.SUKISU_BRANCH }}" ]; then
+                export SUKISU_REF="${{ inputs.SUKISU_BRANCH }}"
+                export SUKISU_BUILTIN_REF="${{ inputs.SUKISU_BRANCH }}"
+              fi
+              bash "$LUMINAIRE_PATCH_DIR/kernel/android14-6.1-lts/ksu/sukisu/sukisu.sh"
+            fi
+            
             echo "::endgroup::"
 
-            DEFCONFIG="arch/arm64/configs/gki_defconfig"
-            if [ -f "$DEFCONFIG" ]; then
-              echo "" >> "$DEFCONFIG"
-              echo "# KernelSU-Next" >> "$DEFCONFIG"
-              echo "CONFIG_KSU=y" >> "$DEFCONFIG"
-              echo "CONFIG_KSU_MANUAL_SU=n" >> "$DEFCONFIG"
-              echo "CONFIG_KSU_KPROBE_HOOKS=y" >> "$DEFCONFIG"
-
-              echo "" >> "$DEFCONFIG"
-              echo "# Required for KSU" >> "$DEFCONFIG"
-              echo "CONFIG_OVERLAY_FS=y" >> "$DEFCONFIG"
-              echo "CONFIG_KPROBES=y" >> "$DEFCONFIG"
-              echo "CONFIG_HAVE_KPROBES=y" >> "$DEFCONFIG"
-              echo "CONFIG_KPROBE_EVENTS=y" >> "$DEFCONFIG"
-              echo "CONFIG_TMPFS_XATTR=y" >> "$DEFCONFIG"
-              echo "CONFIG_TMPFS_POSIX_ACL=y" >> "$DEFCONFIG"
-
-              echo "✓ KSU configs added"
-            fi
-
-            if [ ! -d "drivers/kernelsu" ]; then
-              echo "::error::KernelSU-Next integration failed"
+            if [ ! -d "drivers/kernelsu" ] && [ ! -d "KernelSU" ]; then
+              echo "::error::Root Manager integration failed"
               exit 1
             fi
-
-            # Set KSU version environment
-            echo "KSU_VER=$KSU_BRANCH" >> $GITHUB_ENV
+            
+            # Set KSU_VER dari file script jika tersedia
+            if [ -z "$RESUKISU_VERSION_DISPLAY" ] && [ -z "$SUKISU_VERSION_DISPLAY" ]; then
+              echo "KSU_VER=$ROOT_MANAGER" >> $GITHUB_ENV
+            fi
             cd ..
           fi
-
       - name: Patch SuSFS for 5.10
         if: inputs.ENABLE_KERNELSU_NEXT == true && inputs.ENABLE_SUSFS == true
         run: |
@@ -374,17 +425,31 @@ jobs:
       # ──────────────────────────────────────────────
       # 5. Download toolchain & Build
       # ──────────────────────────────────────────────
-      - name: Download Neutron Clang toolchain
+      - name: Cache Neutron Clang
+        id: cache-clang
+        uses: actions/cache@v4
+        with:
+          path: toolchain
+          key: neutron-clang-${{ runner.os }}-${{ hashFiles('toolchain/antman') }}
+          restore-keys: |
+            neutron-clang-${{ runner.os }}-
+
+      - name: Download Neutron Clang (if not cached)
+        if: steps.cache-clang.outputs.cache-hit != 'true'
         run: |
           echo "::group::Downloading Neutron Clang (via antman)"
-          git clone https://github.com/Neutron-Toolchains/antman --depth=1 "$GITHUB_WORKSPACE/toolchain"
-          cd "$GITHUB_WORKSPACE/toolchain"
+          git clone https://github.com/Neutron-Toolchains/antman --depth=1 toolchain
+          cd toolchain
           ./antman -S
           echo "::endgroup::"
-          echo "Clang version:"
-          "$GITHUB_WORKSPACE/toolchain/bin/clang" --version | head -2
 
-          echo "CLANG_VER=Neutron Clang" >> $GITHUB_ENV
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ runner.os }}-
 
       - name: Build kernel
         run: |
@@ -395,10 +460,22 @@ jobs:
           export ARCH=arm64
           export LLVM=1
           export LLVM_IAS=1
-          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CC="ccache clang"
+          export CROSS_COMPILE="ccache aarch64-linux-gnu-"
+          export CCACHE_DIR=~/.ccache
+          export CCACHE_MAXSIZE=2G
+          export CCACHE_COMPRESS=1
+          export CCACHE_COMPRESSLEVEL=6
+          export PATH="/usr/lib/ccache:$PATH"
 
           echo "::group::Configuring (gki_defconfig)"
           make O=out gki_defconfig
+          # ---- Set CONFIG_HZ to 1000 ----
+          scripts/config --file out/.config -e CONFIG_HZ_1000
+          scripts/config --file out/.config -d CONFIG_HZ_100
+          scripts/config --file out/.config -d CONFIG_HZ_250
+          scripts/config --file out/.config -d CONFIG_HZ_300
+          make O=out olddefconfig
           echo "::endgroup::"
 
           case "$LTO" in
@@ -422,7 +499,7 @@ jobs:
 
           echo "::group::Compiling kernel"
           set -o pipefail
-          make O=out -j"$(nproc --all)" Image 2>&1 | tee build.log || {
+          make O=out -j$(($(nproc --all)*2)) Image 2>&1 | tee build.log || {
             echo "::error::Build failed! Check build.log."
             exit 1
           }
@@ -443,6 +520,10 @@ jobs:
             echo "KVER=Unknown" >> $GITHUB_ENV
           fi
 
+          echo "Clang version:"
+          "$GITHUB_WORKSPACE/toolchain/bin/clang" --version | head -2
+          echo "CLANG_VER=Neutron Clang" >> $GITHUB_ENV
+
       # ──────────────────────────────────────────────
       # 6. Package with AnyKernel3 (AetheriumAnykernel)
       # ──────────────────────────────────────────────
@@ -461,9 +542,16 @@ jobs:
 
           KSU_TAG=""
           if [ "$ENABLE_KSU" = "true" ]; then
-            KSU_TAG="-KSU-Next"
+            if [ "$ROOT_MANAGER" = "KernelSU-Next" ]; then
+              KSU_TAG="-KSU-Next"
+            elif [ "$ROOT_MANAGER" = "ReSukiSU" ]; then
+              KSU_TAG="-ReSukiSU"
+            elif [ "$ROOT_MANAGER" = "SuKiSU-Ultra" ]; then
+              KSU_TAG="-SuKiSU"
+            fi
+            
             if [ "$ENABLE_SUSFS" = "true" ]; then
-              KSU_TAG="-KSU-Next-SuSFS"
+              KSU_TAG="${KSU_TAG}-SuSFS"
             fi
           fi
 
@@ -507,7 +595,7 @@ jobs:
             | **Base Source** | [${{ inputs.BASE_BRANCH }}](<${{ inputs.BASE_REPO }}>) |
             | **Upstream Merged** | ${{ inputs.UPSTREAM_TAG || 'none' }} |
             | **Compiler** | ${{ env.CLANG_VER }} |
-            | **KernelSU-Next** | ${{ env.KSU_VER }} |
+            | **Root Manager** | ${{ env.KSU_VER }} |
             | **SuSFS** | ${{ env.SUSFS_STATUS }} |
             | **Build** | #${{ github.run_number }} |
 
@@ -535,10 +623,18 @@ jobs:
 
           echo "Sending ZIP to Telegram..."
 
+          if [ -n "$RESUKISU_VERSION_DISPLAY" ]; then
+            FINAL_KSU_VER="ReSukiSU $RESUKISU_VERSION_DISPLAY"
+          elif [ -n "$SUKISU_VERSION_DISPLAY" ]; then
+            FINAL_KSU_VER="SuKiSU-Ultra $SUKISU_VERSION_DISPLAY"
+          else
+            FINAL_KSU_VER="${{ env.KSU_VER }}"
+          fi
+
           CAPTION="Build Completed
           Kernel Version: ${{ env.KVER }}
           Compiler: ${{ env.CLANG_VER }}
-          Root Manager: KernelSU-Next (${{ env.KSU_VER }})
+          Root Manager: $FINAL_KSU_VER
           SuSFS: ${{ env.SUSFS_STATUS }}
           LTO: ${{ inputs.LTO_TYPE }}"
 
@@ -562,7 +658,6 @@ jobs:
 
           echo "Build Failed! Sending log to Telegram..."
 
-          # Extract the last 150 lines of the build log and any specific errors
           ERROR_LOG="error_log.txt"
           if [ -f kernel/build.log ]; then
             echo "=== LAST 150 LINES OF LOG ===" > $ERROR_LOG
