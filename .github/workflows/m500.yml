@@ -448,20 +448,53 @@ jobs:
           export LLVM_IAS=1
           export CROSS_COMPILE=aarch64-linux-gnu-
 
+          echo "::group::Adding CONFIG_HZ_500 support"
+          # Android 12 / Linux 5.10 commonly has no HZ_500 choice.
+          # Add it to Kconfig.hz so olddefconfig cannot fall back to 250 Hz.
+          HZ_KCONFIG="kernel/Kconfig.hz"
+          if [ ! -f "$HZ_KCONFIG" ]; then
+            echo "::error::kernel/Kconfig.hz not found"
+            exit 1
+          fi
+
+          if ! grep -q '^config HZ_500$' "$HZ_KCONFIG"; then
+            sed -i '/^config HZ_1000$/i\\
+          config HZ_500\
+            bool "500 HZ"\
+            help\
+              500 Hz timer frequency.\
+' "$HZ_KCONFIG"
+          fi
+
+          if ! grep -q '^default 500 if HZ_500$' "$HZ_KCONFIG"; then
+            sed -i '/^default 300 if HZ_300$/a\
+          default 500 if HZ_500' "$HZ_KCONFIG"
+          fi
+
+          echo "CONFIG_HZ_500 support:"
+          grep -A2 -B1 '^config HZ_500$' "$HZ_KCONFIG" || true
+          grep -E '^default (100|250|300|500|1000) if HZ_' "$HZ_KCONFIG" || true
+          echo "::endgroup::"
+
           echo "::group::Configuring (gki_defconfig)"
           make O=out gki_defconfig
 
-          # Default scheduler tick frequency: 500 Hz
-          # Apply after gki_defconfig so the setting is preserved in out/.config.
+          # Force the 500 Hz choice after defconfig.
           scripts/config --file out/.config \
+            -d HZ_100 \
             -d HZ_250 \
+            -d HZ_300 \
             -e HZ_500 \
             -d HZ_1000
-          scripts/config --file out/.config --set-val HZ 500
           make O=out olddefconfig
 
-          echo "CONFIG_HZ setting:"
-          grep -E '^CONFIG_HZ(_[0-9]+)?=' out/.config | head -10
+          echo "Final timer configuration:"
+          grep -E '^CONFIG_HZ(_[0-9]+)?=' out/.config || true
+          if ! grep -qx 'CONFIG_HZ=500' out/.config; then
+            echo "::error::CONFIG_HZ did not resolve to 500"
+            exit 1
+          fi
+          echo "✓ CONFIG_HZ=500 confirmed"
           echo "::endgroup::"
 
           case "$LTO" in
