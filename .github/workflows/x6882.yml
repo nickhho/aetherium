@@ -1,4 +1,4 @@
-name: deep
+name: V2
 
 on:
   workflow_dispatch:
@@ -425,31 +425,17 @@ jobs:
       # ──────────────────────────────────────────────
       # 5. Download toolchain & Build
       # ──────────────────────────────────────────────
-      - name: Cache Neutron Clang
-        id: cache-clang
-        uses: actions/cache@v4
-        with:
-          path: toolchain
-          key: neutron-clang-${{ runner.os }}-${{ hashFiles('toolchain/antman') }}
-          restore-keys: |
-            neutron-clang-${{ runner.os }}-
-
-      - name: Download Neutron Clang (if not cached)
-        if: steps.cache-clang.outputs.cache-hit != 'true'
+      - name: Download Neutron Clang toolchain
         run: |
           echo "::group::Downloading Neutron Clang (via antman)"
-          git clone https://github.com/Neutron-Toolchains/antman --depth=1 toolchain
-          cd toolchain
+          git clone https://github.com/Neutron-Toolchains/antman --depth=1 "$GITHUB_WORKSPACE/toolchain"
+          cd "$GITHUB_WORKSPACE/toolchain"
           ./antman -S
           echo "::endgroup::"
+          echo "Clang version:"
+          "$GITHUB_WORKSPACE/toolchain/bin/clang" --version | head -2
 
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.ccache
-          key: ccache-${{ runner.os }}-${{ github.sha }}
-          restore-keys: |
-            ccache-${{ runner.os }}-
+          echo "CLANG_VER=Neutron Clang" >> $GITHUB_ENV
 
       - name: Build kernel
         run: |
@@ -460,22 +446,55 @@ jobs:
           export ARCH=arm64
           export LLVM=1
           export LLVM_IAS=1
-          export CC="ccache clang"
-          export CROSS_COMPILE="ccache aarch64-linux-gnu-"
-          export CCACHE_DIR=~/.ccache
-          export CCACHE_MAXSIZE=2G
-          export CCACHE_COMPRESS=1
-          export CCACHE_COMPRESSLEVEL=6
-          export PATH="/usr/lib/ccache:$PATH"
+          export CROSS_COMPILE=aarch64-linux-gnu-
+
+          echo "::group::Adding CONFIG_HZ_500 support"
+          # Android 12 / Linux 5.10 commonly has no HZ_500 choice.
+          # Add it to Kconfig.hz so olddefconfig cannot fall back to 250 Hz.
+          HZ_KCONFIG="kernel/Kconfig.hz"
+          if [ ! -f "$HZ_KCONFIG" ]; then
+            echo "::error::kernel/Kconfig.hz not found"
+            exit 1
+          fi
+
+          if ! grep -q '^config HZ_500$' "$HZ_KCONFIG"; then
+            sed -i '/^config HZ_1000$/i\\
+          config HZ_500\
+            bool "500 HZ"\
+            help\
+              500 Hz timer frequency.\
+          ' "$HZ_KCONFIG"
+          fi
+
+          if ! grep -q '^default 500 if HZ_500$' "$HZ_KCONFIG"; then
+            sed -i '/^default 300 if HZ_300$/a\
+          default 500 if HZ_500' "$HZ_KCONFIG"
+          fi
+
+          echo "CONFIG_HZ_500 support:"
+          grep -A2 -B1 '^config HZ_500$' "$HZ_KCONFIG" || true
+          grep -E '^default (100|250|300|500|1000) if HZ_' "$HZ_KCONFIG" || true
+          echo "::endgroup::"
 
           echo "::group::Configuring (gki_defconfig)"
           make O=out gki_defconfig
-          # ---- Set CONFIG_HZ to 1000 ----
-          scripts/config --file out/.config -e CONFIG_HZ_1000
-          scripts/config --file out/.config -d CONFIG_HZ_100
-          scripts/config --file out/.config -d CONFIG_HZ_250
-          scripts/config --file out/.config -d CONFIG_HZ_300
+
+          # Force the 500 Hz choice after defconfig.
+          scripts/config --file out/.config \
+            -d HZ_100 \
+            -d HZ_250 \
+            -d HZ_300 \
+            -e HZ_500 \
+            -d HZ_1000
           make O=out olddefconfig
+
+          echo "Final timer configuration:"
+          grep -E '^CONFIG_HZ(_[0-9]+)?=' out/.config || true
+          if ! grep -qx 'CONFIG_HZ=500' out/.config; then
+            echo "::error::CONFIG_HZ did not resolve to 500"
+            exit 1
+          fi
+          echo "✓ CONFIG_HZ=500 confirmed"
           echo "::endgroup::"
 
           case "$LTO" in
@@ -499,7 +518,7 @@ jobs:
 
           echo "::group::Compiling kernel"
           set -o pipefail
-          make O=out -j$(($(nproc --all)*2)) Image 2>&1 | tee build.log || {
+          make O=out -j"$(nproc --all)" Image 2>&1 | tee build.log || {
             echo "::error::Build failed! Check build.log."
             exit 1
           }
@@ -519,10 +538,6 @@ jobs:
           else
             echo "KVER=Unknown" >> $GITHUB_ENV
           fi
-
-          echo "Clang version:"
-          "$GITHUB_WORKSPACE/toolchain/bin/clang" --version | head -2
-          echo "CLANG_VER=Neutron Clang" >> $GITHUB_ENV
 
       # ──────────────────────────────────────────────
       # 6. Package with AnyKernel3 (AetheriumAnykernel)
